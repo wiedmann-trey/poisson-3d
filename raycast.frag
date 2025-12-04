@@ -4,8 +4,9 @@ out vec4 fragColor;
 
 uniform sampler3D volumeTex;
 uniform vec3 cameraPos;        // Camera position in texture space [0,1]
-uniform float stepSize;        // Ray step size (e.g., 0.01)
-uniform float densityScale;    // Opacity multiplier (e.g., 2.0)
+uniform vec3 backgroundColor;
+uniform float stepSize; 
+uniform float densityScale;    // Opacity multiplier
 uniform float volumeMax;
 uniform float volumeMin;
 
@@ -23,37 +24,30 @@ void main()
     // Starting point in texture space [0,1]
     vec3 pos = vPos;
     
-    // Accumulated color and alpha
     vec4 accum = vec4(0.0);
     
-    // Ray marching loop
     for(int i = 0; i < 256; i++) {
-        // Check bounds
         if(pos.x < -0.1 || pos.x > 1.1 || 
            pos.y < -0.1 || pos.y > 1.1 || 
            pos.z < -0.1 || pos.z > 1.1) {
             break;
         }
         
-        // Sample volume
         float sample = texture(volumeTex, pos).r;
         sample = (sample - volumeMin) / (volumeMax - volumeMin);
-        float density = sample/64;
+        float density = sample * densityScale;
         vec4 sampleColor = vec4(colorMapRainbow(sample), 0);
         
-        // Simple transfer function (grayscale)
-        sampleColor.a = density * densityScale;
+        sampleColor.a = density;
         
-        // Front-to-back alpha blending
         sampleColor.rgb *= sampleColor.a;
         accum += (1.0 - accum.a) * sampleColor;
         
-        // Early ray termination
         if(accum.a > 0.95) break;
         
-        // Step along ray
         pos += rayDir * stepSize;
     }
-    
-    fragColor = accum;
+
+    vec3 finalColor = accum.rgb + backgroundColor * (1.0 - accum.a);
+    fragColor = vec4(finalColor, 1.0);
 }

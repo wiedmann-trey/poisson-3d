@@ -1,28 +1,25 @@
 cmake_minimum_required(VERSION 3.10)
-project(Raycaster)
+project(Visualizer)
 
 set(CMAKE_CXX_STANDARD 17)
 
 find_package(OpenGL REQUIRED)
 
-# GLEW
 find_package(GLEW REQUIRED)
 
-# GLFW
 find_package(glfw3 REQUIRED)
 
-# GLM (optional but recommended)
 find_package(glm QUIET)
 
-add_executable(raycaster
+add_executable(vis
     main.cpp
 )
 
-target_include_directories(raycaster PRIVATE
+target_include_directories(vis PRIVATE
     ${GLEW_INCLUDE_DIRS}
 )
 
-target_link_libraries(raycaster PRIVATE
+target_link_libraries(vis PRIVATE
     glfw
     ${GLEW_LIBRARIES}
     OpenGL::GL

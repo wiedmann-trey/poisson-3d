@@ -14,7 +14,7 @@ void main()
 {
     // Map cube [0,1]^3 to physical bounding box
     vec3 worldPos = mix(boxMin, boxMax, inPos);
-    vPos = inPos;              // pass texture coords
+    vPos = inPos;
     gl_Position = projection * view * vec4(worldPos, 1.0);
 }
 

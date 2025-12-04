@@ -15,9 +15,6 @@ struct VolumeHeader {
     double end_x, end_y, end_z;
 };
 
-// --------------------------------------------------------
-// Load entire shader file into a string
-// --------------------------------------------------------
 std::string loadFile(const std::string& path) {
     std::ifstream f(path);
     if (!f.is_open()) {
@@ -29,9 +26,6 @@ std::string loadFile(const std::string& path) {
     return ss.str();
 }
 
-// --------------------------------------------------------
-// Compile shader stage
-// --------------------------------------------------------
 GLuint compileShader(const std::string& src, GLenum type) {
     GLuint id = glCreateShader(type);
     const char* s = src.c_str();
@@ -48,9 +42,6 @@ GLuint compileShader(const std::string& src, GLenum type) {
     return id;
 }
 
-// --------------------------------------------------------
-// Link shader program
-// --------------------------------------------------------
 GLuint makeProgram(const std::string& vert, const std::string& frag)
 {
     GLuint vs = compileShader(vert, GL_VERTEX_SHADER);
@@ -75,9 +66,6 @@ GLuint makeProgram(const std::string& vert, const std::string& frag)
     return prog;
 }
 
-// --------------------------------------------------------
-// Load volume with double data and convert to float32 texture
-// --------------------------------------------------------
 bool loadVolume(const std::string& filename,
                 VolumeHeader& hdr,
                 std::vector<double>& dataD)
@@ -105,15 +93,12 @@ bool loadVolume(const std::string& filename,
     return true;
 }
 
-// --------------------------------------------------------
-// Create GL texture (always float32 in OpenGL)
-// --------------------------------------------------------
 GLuint create3DTexture(const VolumeHeader& hdr,
                        const std::vector<double>& dataD)
 {
     std::vector<float> dataF(dataD.size());
     for (size_t i = 0; i < dataD.size(); i++)
-        dataF[i] = (float)dataD[i];   // convert double → float
+        dataF[i] = (float)dataD[i]; 
 
     GLuint id;
     glGenTextures(1, &id);
@@ -138,13 +123,9 @@ GLuint create3DTexture(const VolumeHeader& hdr,
     return id;
 }
 
-// --------------------------------------------------------
-// Cube VAO (a cube in [0,1]^3)
-// --------------------------------------------------------
 GLuint createCubeVAO()
 {
     float verts[] = {
-        // x y z (0 to 1 cube)
         0,0,0, 1,0,0, 1,1,0, 0,1,0,
         0,0,1, 1,0,1, 1,1,1, 0,1,1
     };
@@ -177,37 +158,34 @@ GLuint createCubeVAO()
     return vao;
 }
 
-// Add these global variables at the top of main.cpp
 float camYaw = 1.0f;
 float camPitch = 0.6f;
 double lastMouseX = 0.0;
 double lastMouseY = 0.0;
 bool firstMouse = true;
-bool mousePressed = false;  // Track mouse button state
+bool mousePressed = false; 
 
-// Mouse button callback
 void mouse_button_callback(GLFWwindow* window, int button, int action, int mods)
 {
     if (button == GLFW_MOUSE_BUTTON_LEFT) {
         if (action == GLFW_PRESS) {
             mousePressed = true;
-            firstMouse = true;  // Reset on new press to avoid jump
+            firstMouse = true;
         } else if (action == GLFW_RELEASE) {
             mousePressed = false;
         }
     }
 }
 
-// Mouse movement callback
 void mouse_callback(GLFWwindow* window, double xpos, double ypos)
 {
-    if (!mousePressed) return;  // Only rotate when mouse is pressed
+    if (!mousePressed) return;
 
     if (firstMouse) {
         lastMouseX = xpos;
         lastMouseY = ypos;
         firstMouse = false;
-        return;  // Don't apply movement on first frame
+        return; 
     }
 
     double xoffset = xpos - lastMouseX;
@@ -222,7 +200,6 @@ void mouse_callback(GLFWwindow* window, double xpos, double ypos)
     camYaw += xoffset;
     camPitch += -yoffset;
 
-    // Constrain pitch
     if (camPitch > 1.57f) camPitch = 1.57f;
     if (camPitch < -1.57f) camPitch = -1.57f;
 }
@@ -230,15 +207,13 @@ void mouse_callback(GLFWwindow* window, double xpos, double ypos)
 int main()
 {
     glfwInit();
-    GLFWwindow* win = glfwCreateWindow(1280, 720, "Raycaster", nullptr, nullptr);
+    GLFWwindow* win = glfwCreateWindow(1280, 720, "Visualizer", nullptr, nullptr);
     glfwMakeContextCurrent(win);
     glewInit();
 
-    // Set up mouse input
     glfwSetCursorPosCallback(win, mouse_callback);
-    glfwSetMouseButtonCallback(win, mouse_button_callback);  // Add button callback
+    glfwSetMouseButtonCallback(win, mouse_button_callback);
 
-    // Load volume
     VolumeHeader hdr;
     std::vector<double> dataD;
     if (!loadVolume("volume.bin", hdr, dataD)) {
@@ -260,6 +235,8 @@ int main()
     std::string fs = loadFile("raycast.frag");
     GLuint prog = makeProgram(vs, fs);
 
+    glm::vec3 backgroundColor(.11, .11, .11);
+
     float fovY = glm::radians(60.0f);
     float camDist = 1.5 * 0.5f * maxDim / std::tan(fovY / 2.0f);
 
@@ -276,9 +253,7 @@ int main()
         100.0f
     );
 
-    // Main loop
     while (!glfwWindowShouldClose(win)) {
-        // Update camera position based on yaw and pitch
         glm::vec3 camPos(
             camDist * cos(camPitch) * cos(camYaw),
             camDist * sin(camPitch),
@@ -288,9 +263,8 @@ int main()
 
         glm::mat4 view = glm::lookAt(camPos, target, up);
 
-        // Transform camera to texture space
         glm::vec3 camPosTexture = (camPos - boxMin) / (boxMax - boxMin);
-
+        glClearColor(backgroundColor.x, backgroundColor.y, backgroundColor.z, 1.0f); 
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
         glEnable(GL_DEPTH_TEST);
 
@@ -300,15 +274,16 @@ int main()
                    hdr.start_x, hdr.start_y, hdr.start_z);
         glUniform3f(glGetUniformLocation(prog, "boxMax"),
                    hdr.end_x, hdr.end_y, hdr.end_z);
+        glUniform3f(glGetUniformLocation(prog, "backgroundColor"),
+                   backgroundColor.x, backgroundColor.y, backgroundColor.z);
 
         glUniformMatrix4fv(glGetUniformLocation(prog, "projection"), 1, GL_FALSE, &projection[0][0]);
         glUniformMatrix4fv(glGetUniformLocation(prog, "view"), 1, GL_FALSE, &view[0][0]);
 
-        // Send camera position in texture space
         glUniform3f(glGetUniformLocation(prog, "cameraPos"),
                     camPosTexture.x, camPosTexture.y, camPosTexture.z);
         glUniform1f(glGetUniformLocation(prog, "stepSize"), 0.01f);
-        glUniform1f(glGetUniformLocation(prog, "densityScale"), 2.0f);
+        glUniform1f(glGetUniformLocation(prog, "densityScale"), 0.015625f);
         glUniform1f(glGetUniformLocation(prog, "volumeMin"), volumeMin);
         glUniform1f(glGetUniformLocation(prog, "volumeMax"), volumeMax);
 
