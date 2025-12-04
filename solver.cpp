@@ -10,10 +10,46 @@
 #include <stdlib.h>
 #include <iostream>
 
-// 3D test function: u(x,y,z) = sin(2πx)*sin(2πy)*sin(2πz)
-#define U(x,y,z) (cos(2*M_PI*x)*cos(2*M_PI*y)*cos(2*M_PI*z))
-#define RHS(x,y,z) (-3*(2*M_PI)*(2*M_PI)*cos(2*M_PI*x)*cos(2*M_PI*y)*cos(2*M_PI*z))
-// Laplacian: ∇²u = -3*(2π)²*sin(2πx)*sin(2πy)*sin(2πz)
+//#define U(x,y,z) (sin(2*M_PI*x)*sin(2*M_PI*y)*sin(2*M_PI*z))
+//#define RHS(x,y,z) (-3*(2*M_PI)*(2*M_PI)*sin(2*M_PI*x)*sin(2*M_PI*y)*sin(2*M_PI*z))
+
+//torus 
+//#define U(x,y,z) (cos(M_PI*sqrt((x)*(x) + (y)*(y))) * exp(-2*(z)*(z)))
+//#define RHS(x,y,z) (torus_rhs_helper((x),(y),(z)))
+
+// gyroid approximation
+//#define U(x,y,z) (sin(x)*cos(y) + sin(y)*cos(z) + sin(z)*cos(x))
+//#define RHS(x,y,z) (-sin(x)*cos(y) - sin(y)*cos(z) - sin(z)*cos(x))
+
+// braided helical 
+// Domain: [-1, 1] x [-1, 1] x [-2, 2]
+#define U(x,y,z) (sin(3*atan2(y,x) + 2*M_PI*z)*exp(-2*(x*x + y*y)))
+#define RHS(x,y,z) ( \
+    (fabs(x*x + y*y) < 1e-8) ? 0.0 : \
+    (exp(-2*(x*x + y*y)) * \
+     (-9 + 16*pow(x,4) - 4*(2 + M_PI*M_PI)*y*y + 16*pow(y,4) - \
+      4*x*x*(2 + M_PI*M_PI - 8*y*y)) * \
+     sin(2*M_PI*z + 3*atan2(y,x))) / \
+    (x*x + y*y) \
+)
+
+inline double torus_rhs_helper(double x, double y, double z) {
+    double rho = sqrt(x*x + y*y);
+    double exp_term = exp(-2*z*z);
+    double cos_term = cos(M_PI*rho);
+    
+    if (rho < 1e-10) {
+        // Limit as rho->0: -sin(pi*rho)/rho -> -pi
+
+        return -exp_term * (4 + M_PI*M_PI - 16*z*z) * cos_term - exp_term * (-M_PI);
+    }
+    
+    double sin_term = sin(M_PI*rho);
+    
+    // From Wolfram Alpha:
+    // ∇²u = e^(-2z²) * [-(4 + π² - 16z²)cos(πρ) - π*sin(πρ)/ρ]
+    return -exp_term * ((4 + M_PI*M_PI - 16*z*z) * cos_term + M_PI*sin_term/rho);
+}
 
 struct timespec start, end, total_start, total_end;
 
@@ -63,7 +99,7 @@ struct SolverState {
     double avg_update_time, avg_reduction_time;
     int n_iters, n_reductions;
     bool write_solution;
-    int write_solution_every_n;
+    int write_solution_every_n, last_write;
     std::string output_dir;
 };
 
@@ -674,7 +710,7 @@ void solver(SolverState &state) {
         }
 
         if(state.write_solution_every_n > 0 && iter % state.write_solution_every_n == 0 && state.write_solution) {
-          write_solution_to_file(state, make_filename(state.output_dir, "solution", iter, state.max_iter).c_str());
+          if(state.last_write == 0 || iter <= state.last_write) write_solution_to_file(state, make_filename(state.output_dir, "solution", iter, state.max_iter).c_str());
         }
     }
     
@@ -682,7 +718,7 @@ void solver(SolverState &state) {
     
     compare_solution(state);
 
-    if(state.write_solution) write_solution_to_file(state, make_filename(state.output_dir, "solution", iter, state.max_iter).c_str());
+    if(state.write_solution && (state.last_write == 0 || iter <= state.last_write)) write_solution_to_file(state, make_filename(state.output_dir, "solution", iter, state.max_iter).c_str());
     //write_rank_to_file(state, "ranks.bin");
     //write_halo_to_file(state, "halo.bin");
 }
@@ -800,15 +836,15 @@ int main(int argc, char **argv) {
     state.blockDim = dim3(32, 8, 4);
     state.extractBlockDim = dim3(256);
     
-    state.boundary_start_x = 0.0;
-    state.boundary_start_y = 0.0;
-    state.boundary_start_z = 0.0;
-    state.boundary_end_x = 1.0;
-    state.boundary_end_y = 1.0;
-    state.boundary_end_z = 2.0;
+    state.boundary_start_x = -1.0;
+    state.boundary_start_y = -1.0;
+    state.boundary_start_z = -2.0;
+    state.boundary_end_x = 1;
+    state.boundary_end_y = 1;
+    state.boundary_end_z = 2;
     
     state.max_iter = 500000;
-    state.check_convergence_every_n = 1000;
+    state.check_convergence_every_n = 100;
     state.convergence_bound = 1e-6;
     
     state.avg_update_time = 0;
@@ -818,7 +854,8 @@ int main(int argc, char **argv) {
 
     state.write_solution = true;
     state.write_solution_every_n = 100;
-    state.output_dir = "output";
+    state.last_write = 0;
+    state.output_dir = "output_helix";
 
     setup_mpi(state);
     setup_hip(state);

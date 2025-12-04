@@ -2,7 +2,9 @@
 in vec3 vPos;
 out vec4 fragColor;
 
-uniform sampler3D volumeTex;
+uniform sampler3D volumeTexPrev;
+uniform sampler3D volumeTexNext;
+uniform float t;
 uniform vec3 cameraPos;        // Camera position in texture space [0,1]
 uniform vec3 backgroundColor;
 uniform float stepSize; 
@@ -33,7 +35,8 @@ void main()
             break;
         }
         
-        float sample = texture(volumeTex, pos).r;
+        float sample = mix(texture(volumeTexPrev, pos).r, texture(volumeTexNext, pos).r, t);
+        sample = clamp(sample, volumeMin, volumeMax);
         sample = (sample - volumeMin) / (volumeMax - volumeMin);
         float density = sample * densityScale;
         vec4 sampleColor = vec4(colorMapRainbow(sample), 0);

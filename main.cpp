@@ -8,6 +8,10 @@
 #include <iostream>
 #include <sstream>
 #include <algorithm>
+#include <filesystem>
+#include <cstring>
+
+namespace fs = std::filesystem;
 
 struct VolumeHeader {
     int nx, ny, nz;
@@ -123,6 +127,23 @@ GLuint create3DTexture(const VolumeHeader& hdr,
     return id;
 }
 
+void updateTexture(GLuint texId, const VolumeHeader& hdr, const std::vector<double>& dataD)
+{
+    std::vector<float> dataF(dataD.size());
+    for (size_t i = 0; i < dataD.size(); i++)
+        dataF[i] = (float)dataD[i];
+
+    glBindTexture(GL_TEXTURE_3D, texId);
+    glTexSubImage3D(GL_TEXTURE_3D,
+                    0,
+                    0, 0, 0,
+                    hdr.nx, hdr.ny, hdr.nz,
+                    GL_RED,
+                    GL_FLOAT,
+                    dataF.data());
+    glBindTexture(GL_TEXTURE_3D, 0);
+}
+
 GLuint createCubeVAO()
 {
     float verts[] = {
@@ -204,8 +225,68 @@ void mouse_callback(GLFWwindow* window, double xpos, double ypos)
     if (camPitch < -1.57f) camPitch = -1.57f;
 }
 
-int main()
+void printUsage(const char* progName) {
+    std::cerr << "Usage:\n";
+    std::cerr << "  " << progName << " <directory> <fps> <visMin> <visMax>\n";
+    std::cerr << "  " << progName << " --static <filename> <visMin> <visMax>\n";
+}
+
+int main(int argc, char** argv)
 {
+    bool staticMode = false;
+    std::string inputPath;
+    float fps = 30.0f;
+    float volumeMin = 0.0f;
+    float volumeMax = 1.0f;
+
+    if (argc == 5 && std::strcmp(argv[1], "--static") == 0) {
+        staticMode = true;
+        inputPath = argv[2];
+        volumeMin = std::stof(argv[3]);
+        volumeMax = std::stof(argv[4]);
+    } else if (argc == 5) {
+        staticMode = false;
+        inputPath = argv[1];
+        fps = std::stof(argv[2]);
+        volumeMin = std::stof(argv[3]);
+        volumeMax = std::stof(argv[4]);
+    } else {
+        printUsage(argv[0]);
+        return 1;
+    }
+
+    std::vector<std::string> volumeFiles;
+    VolumeHeader hdr;
+    
+    if (staticMode) {
+        volumeFiles.push_back(inputPath);
+    } else {
+        if (!fs::is_directory(inputPath)) {
+            std::cerr << "Error: " << inputPath << " is not a directory\n";
+            return 1;
+        }
+        
+        for (const auto& entry : fs::directory_iterator(inputPath)) {
+            if (entry.is_regular_file()) {
+                volumeFiles.push_back(entry.path().string());
+            }
+        }
+        
+        if (volumeFiles.empty()) {
+            std::cerr << "Error: No files found in directory\n";
+            return 1;
+        }
+        
+        std::sort(volumeFiles.begin(), volumeFiles.end());
+    }
+
+    // Load first volume to get header info
+    std::vector<double> dataD;
+    if (!loadVolume(volumeFiles[0], hdr, dataD)) {
+        std::cerr << "Failed loading first volume\n";
+        return 1;
+    }
+
     glfwInit();
     GLFWwindow* win = glfwCreateWindow(1280, 720, "Visualizer", nullptr, nullptr);
     glfwMakeContextCurrent(win);
@@ -214,21 +295,15 @@ int main()
     glfwSetCursorPosCallback(win, mouse_callback);
     glfwSetMouseButtonCallback(win, mouse_button_callback);
 
-    VolumeHeader hdr;
-    std::vector<double> dataD;
-    if (!loadVolume("volume.bin", hdr, dataD)) {
-        std::cerr << "Failed loading volume\n";
-        return 1;
-    }
     glm::vec3 boxMin(hdr.start_x, hdr.start_y, hdr.start_z);
     glm::vec3 boxMax(hdr.end_x, hdr.end_y, hdr.end_z);
     glm::vec3 boxCenter = (boxMax+boxMin)/glm::vec3(2.0);
     glm::vec3 size = boxMax - boxMin;
     float maxDim = std::max(size.x, std::max(size.y, size.z));
-    float volumeMax = (float)*std::max_element(dataD.begin(), dataD.end());
-    float volumeMin = (float)*std::min_element(dataD.begin(), dataD.end());
 
-    GLuint tex3D = create3DTexture(hdr, dataD);
+    GLuint texPrev = create3DTexture(hdr, dataD);
+    GLuint texNext = create3DTexture(hdr, dataD);
+    
     GLuint cube = createCubeVAO();
 
     std::string vs = loadFile("shader.vert");
@@ -253,7 +328,45 @@ int main()
         100.0f
     );
 
+    double lastTime = glfwGetTime();
+    int currentFrame = 0;
+    int nextFrame = staticMode ? 0 : 1;
+    float t = 0.0f;
+    float frameDuration = 1.0f / fps;
+
+    // Load next frame
+    if (!staticMode && volumeFiles.size() > 1) {
+        std::vector<double> nextData;
+        if (loadVolume(volumeFiles[nextFrame], hdr, nextData)) {
+            updateTexture(texNext, hdr, nextData);
+        }
+    }
+
     while (!glfwWindowShouldClose(win)) {
+        double currentTime = glfwGetTime();
+        double deltaTime = currentTime - lastTime;
+        lastTime = currentTime;
+
+        // Update animation
+        if (!staticMode && volumeFiles.size() > 1) {
+            t += deltaTime / frameDuration;
+            
+            if (t >= 1.0f) {
+                t = 0.0f;
+                currentFrame = nextFrame;
+                nextFrame = (nextFrame + 1) % volumeFiles.size();
+                
+                GLuint temp = texPrev;
+                texPrev = texNext;
+                texNext = temp;
+                
+                std::vector<double> nextData;
+                if (loadVolume(volumeFiles[nextFrame], hdr, nextData)) {
+                    updateTexture(texNext, hdr, nextData);
+                }
+            }
+        }
+
         glm::vec3 camPos(
             camDist * cos(camPitch) * cos(camYaw),
             camDist * sin(camPitch),
@@ -283,13 +396,18 @@ int main()
         glUniform3f(glGetUniformLocation(prog, "cameraPos"),
                     camPosTexture.x, camPosTexture.y, camPosTexture.z);
         glUniform1f(glGetUniformLocation(prog, "stepSize"), 0.01f);
-        glUniform1f(glGetUniformLocation(prog, "densityScale"), 0.015625f);
+        glUniform1f(glGetUniformLocation(prog, "densityScale"), 0.03125f);
         glUniform1f(glGetUniformLocation(prog, "volumeMin"), volumeMin);
         glUniform1f(glGetUniformLocation(prog, "volumeMax"), volumeMax);
+        glUniform1f(glGetUniformLocation(prog, "t"), t);
 
         glActiveTexture(GL_TEXTURE0);
-        glBindTexture(GL_TEXTURE_3D, tex3D);
-        glUniform1i(glGetUniformLocation(prog, "volumeTex"), 0);
+        glBindTexture(GL_TEXTURE_3D, texPrev);
+        glUniform1i(glGetUniformLocation(prog, "volumeTexPrev"), 0);
+        
+        glActiveTexture(GL_TEXTURE1);
+        glBindTexture(GL_TEXTURE_3D, texNext);
+        glUniform1i(glGetUniformLocation(prog, "volumeTexNext"), 1);
 
         glBindVertexArray(cube);
         glDrawElements(GL_TRIANGLES, 36, GL_UNSIGNED_INT, 0);
@@ -298,6 +416,8 @@ int main()
         glfwPollEvents();
     }
 
+    glDeleteTextures(1, &texPrev);
+    glDeleteTextures(1, &texNext);
     glfwTerminate();
     return 0;
 }
