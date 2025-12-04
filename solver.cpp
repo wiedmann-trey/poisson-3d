@@ -2,6 +2,10 @@
 #include <hip/hip_runtime.h>
 #include <stdio.h>
 #include <math.h>
+#include <string>
+#include <sstream>
+#include <iomanip>
+#include <filesystem>
 #include <time.h>
 #include <stdlib.h>
 #include <iostream>
@@ -55,9 +59,12 @@ struct SolverState {
     dim3 blockDim, gridDim;
     dim3 extractBlockDim, extractGridDim;
     
-    // Statistics
+    // Statistics and logging
     double avg_update_time, avg_reduction_time;
     int n_iters, n_reductions;
+    bool write_solution;
+    int write_solution_every_n;
+    std::string output_dir;
 };
 
 // Red-Black Gauss-Seidel kernel
@@ -458,6 +465,110 @@ void compare_solution(SolverState &state) {
     }
 }
 
+void write_halo_to_file(SolverState &state, const char* filename) {
+    MPI_File fh;
+    MPI_File_open(state.cart_comm, filename, 
+                  MPI_MODE_CREATE | MPI_MODE_WRONLY, 
+                  MPI_INFO_NULL, &fh);
+    
+    if(state.rank == 0) {
+        int header[3] = {state.nx, state.ny, state.nz};
+        MPI_File_write(fh, header, 3, MPI_INT, MPI_STATUS_IGNORE);
+        
+        double bounds[6] = {state.boundary_start_x, state.boundary_start_y, state.boundary_start_z,
+                           state.boundary_end_x, state.boundary_end_y, state.boundary_end_z};
+        MPI_File_write(fh, bounds, 6, MPI_DOUBLE, MPI_STATUS_IGNORE);
+    }
+    
+    MPI_Offset header_size = 3 * sizeof(int) + 6 * sizeof(double);
+
+    double *arr = (double*) malloc(state.local_nx * sizeof(double));
+    
+    for(int z = 0; z < state.local_nz; z++) {
+      for(int y = 0; y < state.local_ny; y++) {
+        int global_z = z + state.global_z_start;
+        int global_y = y + state.global_y_start;
+
+        long long global_offset = global_z * state.nx * state.ny + global_y * state.nx + state.global_x_start;
+        long long local_offset = z * state.local_nx * state.local_ny + y * state.local_nx;
+
+        for(int i = 0; i < state.local_nx; i++) {
+          if (z == 0 && state.coords[2] > 0) {
+            arr[i] = 1.0;
+            continue;
+          }
+          if (z == state.local_nz-1 && state.coords[2] < state.dims[2]-1) {
+            arr[i] = 1.0;
+            continue;
+          }
+          if (y == 0 && state.coords[1] > 0) {
+            arr[i] = 1.0;
+            continue;
+          }
+          if (y == state.local_ny-1 && state.coords[1] < state.dims[1]-1) {
+            arr[i] = 1.0;
+            continue;
+          }
+          if (i == 0 && state.coords[0] > 0) {
+            arr[i] = 1.0;
+            continue;
+          }
+          if (i == state.local_nx-1 && state.coords[0] < state.dims[0]-1) {
+            arr[i] = 1.0;
+            continue;
+          }
+          arr[i] = 0.0;
+        }
+
+        MPI_Offset file_offset = header_size + global_offset * sizeof(double);
+        
+        MPI_File_write_at(fh, file_offset, arr, state.local_nx, 
+                          MPI_DOUBLE, MPI_STATUS_IGNORE);
+      }
+    }
+    
+    MPI_File_close(&fh);
+}
+
+void write_rank_to_file(SolverState &state, const char* filename) {
+    MPI_File fh;
+    MPI_File_open(state.cart_comm, filename, 
+                  MPI_MODE_CREATE | MPI_MODE_WRONLY, 
+                  MPI_INFO_NULL, &fh);
+    
+    if(state.rank == 0) {
+        int header[3] = {state.nx, state.ny, state.nz};
+        MPI_File_write(fh, header, 3, MPI_INT, MPI_STATUS_IGNORE);
+        
+        double bounds[6] = {state.boundary_start_x, state.boundary_start_y, state.boundary_start_z,
+                           state.boundary_end_x, state.boundary_end_y, state.boundary_end_z};
+        MPI_File_write(fh, bounds, 6, MPI_DOUBLE, MPI_STATUS_IGNORE);
+    }
+    
+    MPI_Offset header_size = 3 * sizeof(int) + 6 * sizeof(double);
+
+    double *arr = (double*) malloc(state.local_nx * sizeof(double));
+    for(int i = 0; i < state.local_nx; i++) arr[i] = (double) state.rank;
+    
+    for(int z = 0; z < state.local_nz; z++) {
+      for(int y = 0; y < state.local_ny; y++) {
+        int global_z = z + state.global_z_start;
+        int global_y = y + state.global_y_start;
+
+        long long global_offset = global_z * state.nx * state.ny + global_y * state.nx + state.global_x_start;
+        long long local_offset = z * state.local_nx * state.local_ny + y * state.local_nx;
+
+        MPI_Offset file_offset = header_size + global_offset * sizeof(double);
+        
+        MPI_File_write_at(fh, file_offset, arr, state.local_nx, 
+                          MPI_DOUBLE, MPI_STATUS_IGNORE);
+      }
+    }
+    free(arr);
+    
+    MPI_File_close(&fh);
+}
+
 void write_solution_to_file(SolverState &state, const char* filename) {
     int local_size = state.local_nx * state.local_ny * state.local_nz;
 
@@ -500,6 +611,30 @@ void write_solution_to_file(SolverState &state, const char* filename) {
     MPI_File_close(&fh);
 }
 
+
+std::string make_filename(const std::string& folder,
+                          const std::string& basename,
+                          int iter,
+                          int max_iters)
+{
+    namespace fs = std::filesystem;
+
+    fs::create_directories(folder);
+
+    int digits = std::to_string(max_iters).size();
+
+    std::string f = folder;
+    if (!f.empty() && f.back() != '/' && f.back() != '\\')
+        f += '/';
+
+    std::ostringstream ss;
+    ss << f << basename << "_" 
+       << std::setw(digits) << std::setfill('0') << iter 
+       << ".bin";
+
+    return ss.str();
+}
+
 void solver(SolverState &state) {
     
     initialize_grid(state);
@@ -517,7 +652,8 @@ void solver(SolverState &state) {
     
     clock_gettime(CLOCK_MONOTONIC, &total_start);
     
-    for(int iter = 0; iter < state.max_iter; iter++) {
+    int iter = 0;
+    for(; iter < state.max_iter; iter++) {
         state.n_iters++;
         
         if(state.rank == 0) clock_gettime(CLOCK_MONOTONIC, &start);
@@ -536,13 +672,19 @@ void solver(SolverState &state) {
                 break;
             }
         }
+
+        if(state.write_solution_every_n > 0 && iter % state.write_solution_every_n == 0 && state.write_solution) {
+          write_solution_to_file(state, make_filename(state.output_dir, "solution", iter, state.max_iter).c_str());
+        }
     }
     
     clock_gettime(CLOCK_MONOTONIC, &total_end);
     
     compare_solution(state);
 
-    write_solution_to_file(state, "solution.bin");
+    if(state.write_solution) write_solution_to_file(state, make_filename(state.output_dir, "solution", iter, state.max_iter).c_str());
+    //write_rank_to_file(state, "ranks.bin");
+    //write_halo_to_file(state, "halo.bin");
 }
 
 void setup_mpi(SolverState &state) {
@@ -651,9 +793,9 @@ int main(int argc, char **argv) {
 
     SolverState state;
     
-    state.nx = 256;
-    state.nz = 256;
-    state.ny = 256;
+    state.nx = 64;
+    state.nz = 64;
+    state.ny = 64;
 
     state.blockDim = dim3(32, 8, 4);
     state.extractBlockDim = dim3(256);
@@ -673,6 +815,10 @@ int main(int argc, char **argv) {
     state.avg_reduction_time = 0;
     state.n_iters = 0;
     state.n_reductions = 0;
+
+    state.write_solution = true;
+    state.write_solution_every_n = 100;
+    state.output_dir = "output";
 
     setup_mpi(state);
     setup_hip(state);
