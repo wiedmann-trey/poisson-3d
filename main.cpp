@@ -185,6 +185,14 @@ double lastMouseX = 0.0;
 double lastMouseY = 0.0;
 bool firstMouse = true;
 bool mousePressed = false; 
+bool autoSpin = false;
+
+void key_callback(GLFWwindow* window, int key, int scancode, int action, int mods)
+{
+    if (key == GLFW_KEY_SPACE && action == GLFW_PRESS) {
+        autoSpin = !autoSpin;
+    }
+}
 
 void mouse_button_callback(GLFWwindow* window, int button, int action, int mods)
 {
@@ -294,6 +302,7 @@ int main(int argc, char** argv)
 
     glfwSetCursorPosCallback(win, mouse_callback);
     glfwSetMouseButtonCallback(win, mouse_button_callback);
+    glfwSetKeyCallback(win, key_callback);
 
     glm::vec3 boxMin(hdr.start_x, hdr.start_y, hdr.start_z);
     glm::vec3 boxMax(hdr.end_x, hdr.end_y, hdr.end_z);
@@ -365,6 +374,10 @@ int main(int argc, char** argv)
                     updateTexture(texNext, hdr, nextData);
                 }
             }
+        }
+
+        if (autoSpin) {
+            camYaw += float(deltaTime) * 0.5f;
         }
 
         glm::vec3 camPos(

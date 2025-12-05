@@ -9,13 +9,17 @@
 #include <time.h>
 #include <stdlib.h>
 #include <iostream>
+#include <roctracer/roctx.h>
+
+#define BLOCK_X 32
+#define BLOCK_Y 8
+#define BLOCK_Z 4
 
 //#define U(x,y,z) (sin(2*M_PI*x)*sin(2*M_PI*y)*sin(2*M_PI*z))
 //#define RHS(x,y,z) (-3*(2*M_PI)*(2*M_PI)*sin(2*M_PI*x)*sin(2*M_PI*y)*sin(2*M_PI*z))
 
-//torus 
-//#define U(x,y,z) (cos(M_PI*sqrt((x)*(x) + (y)*(y))) * exp(-2*(z)*(z)))
-//#define RHS(x,y,z) (torus_rhs_helper((x),(y),(z)))
+#define U(x,y,z) (cos(2*M_PI*x)*cos(2*M_PI*y)*cos(2*M_PI*z))
+#define RHS(x,y,z) (-3*(2*M_PI)*(2*M_PI)*cos(2*M_PI*x)*cos(2*M_PI*y)*cos(2*M_PI*z))
 
 // gyroid approximation
 //#define U(x,y,z) (sin(x)*cos(y) + sin(y)*cos(z) + sin(z)*cos(x))
@@ -23,8 +27,8 @@
 
 // braided helical 
 // Domain: [-1, 1] x [-1, 1] x [-2, 2]
-#define U(x,y,z) (sin(3*atan2(y,x) + 2*M_PI*z)*exp(-2*(x*x + y*y)))
-#define RHS(x,y,z) ( \
+//#define U(x,y,z) (sin(3*atan2(y,x) + 2*M_PI*z)*exp(-2*(x*x + y*y)))
+//#define RHS(x,y,z) ( \
     (fabs(x*x + y*y) < 1e-8) ? 0.0 : \
     (exp(-2*(x*x + y*y)) * \
      (-9 + 16*pow(x,4) - 4*(2 + M_PI*M_PI)*y*y + 16*pow(y,4) - \
@@ -33,21 +37,21 @@
     (x*x + y*y) \
 )
 
+//torus 
+//#define U(x,y,z) (cos(M_PI*sqrt((x)*(x) + (y)*(y))) * exp(-2*(z)*(z)))
+//#define RHS(x,y,z) (torus_rhs_helper((x),(y),(z)))
+
 inline double torus_rhs_helper(double x, double y, double z) {
     double rho = sqrt(x*x + y*y);
     double exp_term = exp(-2*z*z);
     double cos_term = cos(M_PI*rho);
     
     if (rho < 1e-10) {
-        // Limit as rho->0: -sin(pi*rho)/rho -> -pi
-
         return -exp_term * (4 + M_PI*M_PI - 16*z*z) * cos_term - exp_term * (-M_PI);
     }
     
     double sin_term = sin(M_PI*rho);
     
-    // From Wolfram Alpha:
-    // ∇²u = e^(-2z²) * [-(4 + π² - 16z²)cos(πρ) - π*sin(πρ)/ρ]
     return -exp_term * ((4 + M_PI*M_PI - 16*z*z) * cos_term + M_PI*sin_term/rho);
 }
 
@@ -103,7 +107,93 @@ struct SolverState {
     std::string output_dir;
 };
 
-// Red-Black Gauss-Seidel kernel
+// Red-Black Gauss-Seidel kernel with blocking
+__global__
+void red_black_kernel_blocked(double *u, double *rhs, 
+                      double *north_data, double *south_data,
+                      double *east_data, double *west_data,
+                      double *top_data, double *bottom_data,
+                      int local_nx, int local_ny, int local_nz, 
+                      double a_x, double a_y, double a_z, double a_f,
+                      int red_pass) {
+
+    __shared__ double s_u[BLOCK_Z+2][BLOCK_Y+2][BLOCK_X+2];
+
+    int k = blockIdx.x * blockDim.x + threadIdx.x;
+    int j = blockIdx.y * blockDim.y + threadIdx.y;
+    int i = blockIdx.z * blockDim.z + threadIdx.z;
+
+    int lk = threadIdx.x + 1;
+    int lj = threadIdx.y + 1;
+    int li = threadIdx.z + 1;
+    
+    // Load shared memory
+    if(i < local_nz && j < local_ny && k < local_nx) {
+        int idx = i*local_ny*local_nx + j*local_nx + k;
+        s_u[li][lj][lk] = u[idx];
+    }
+
+    if(threadIdx.x == 0 && k > 0 && i < local_nz && j < local_ny) {
+        s_u[li][lj][0] = u[i*local_ny*local_nx + j*local_nx + k-1];
+    } else if(threadIdx.x == 0 && k == 0 && i < local_nz && j < local_ny) {
+        s_u[li][lj][0] = west_data[i*local_ny + j];
+    }
+    
+    if(threadIdx.x == BLOCK_X-1 && k < local_nx-1 && i < local_nz && j < local_ny) {
+
+        s_u[li][lj][BLOCK_X+1] = u[i*local_ny*local_nx + j*local_nx + k+1];
+
+    } else if(threadIdx.x == BLOCK_X-1 && k == local_nx-1 && i < local_nz && j < local_ny) {
+        s_u[li][lj][BLOCK_X+1] = east_data[i*local_ny + j];
+    }
+    
+    if(threadIdx.y == 0 && j > 0 && i < local_nz && k < local_nx) {
+        s_u[li][0][lk] = u[i*local_ny*local_nx + (j-1)*local_nx + k];
+    } else if(threadIdx.y == 0 && j == 0 && i < local_nz && k < local_nx) {
+        s_u[li][0][lk] = south_data[i*local_nx + k];
+    }
+    
+    if(threadIdx.y == BLOCK_Y-1 && j < local_ny-1 && i < local_nz && k < local_nx) {
+        s_u[li][BLOCK_Y+1][lk] = u[i*local_ny*local_nx + (j+1)*local_nx + k];
+    } else if(threadIdx.y == BLOCK_Y-1 && j == local_ny-1 && i < local_nz && k < local_nx) {
+        s_u[li][BLOCK_Y+1][lk] = north_data[i*local_nx + k];
+    }
+    
+    if(threadIdx.z == 0 && i > 0 && j < local_ny && k < local_nx) {
+        s_u[0][lj][lk] = u[(i-1)*local_ny*local_nx + j*local_nx + k];
+    } else if(threadIdx.z == 0 && i == 0 && j < local_ny && k < local_nx) {
+        s_u[0][lj][lk] = bottom_data[j*local_nx + k];
+    }
+    
+    if(threadIdx.z == BLOCK_Z-1 && i < local_nz-1 && j < local_ny && k < local_nx) {
+        s_u[BLOCK_Z+1][lj][lk] = u[(i+1)*local_ny*local_nx + j*local_nx + k];
+    } else if(threadIdx.z == BLOCK_Z-1 && i == local_nz-1 && j < local_ny && k < local_nx) {
+        s_u[BLOCK_Z+1][lj][lk] = top_data[j*local_nx + k];
+    }
+    
+    __syncthreads();
+   
+    // update
+    if(i < local_nz && j < local_ny && k < local_nx) {
+        int sum = i + j + k;
+        if((sum % 2) == red_pass) {
+            int idx = i*local_ny*local_nx + j*local_nx + k;
+            
+            double west_val = s_u[li][lj][lk-1];
+            double east_val = s_u[li][lj][lk+1];
+            double south_val = s_u[li][lj-1][lk];
+            double north_val = s_u[li][lj+1][lk];
+            double bottom_val = s_u[li-1][lj][lk];
+            double top_val = s_u[li+1][lj][lk];
+            
+            u[idx] = a_x * (west_val + east_val) + 
+                     a_y * (south_val + north_val) + 
+                     a_z * (bottom_val + top_val) - 
+                     a_f * rhs[idx];
+        }
+    }
+}
+
 __global__
 void red_black_kernel(double *u, double *rhs, 
                       double *north_data, double *south_data,
@@ -191,7 +281,6 @@ void residual_kernel(double *u, double *rhs, double *residual_sum,
         double bottom_val = (i == 0) ? bottom_data[j*local_nx + k] : u[(i-1)*local_ny*local_nx + j*local_nx + k];
         double top_val = (i == local_nz-1) ? top_data[j*local_nx + k] : u[(i+1)*local_ny*local_nx + j*local_nx + k];
         
-        // Compute Laplacian: ∇²u = (u_i-1 - 2u + u_i+1)/Δx² + (u_j-1 - 2u + u_j+1)/Δy² + (u_k-1 - 2u + u_k+1)/Δz²
         double laplacian = (west_val - 2.0*u[idx] + east_val) / (delta_x * delta_x) +
                           (south_val - 2.0*u[idx] + north_val) / (delta_y * delta_y) +
                           (bottom_val - 2.0*u[idx] + top_val) / (delta_z * delta_z);
@@ -209,6 +298,7 @@ void residual_kernel(double *u, double *rhs, double *residual_sum,
         }
         atomicAdd(residual_sum, block_res);
     }
+
 }
 
 __global__
@@ -265,6 +355,7 @@ void initialize_grid(SolverState &state) {
     state.h_out_top = (double*)malloc(state.local_nx * state.local_ny * sizeof(double));
     state.h_out_bottom = (double*)malloc(state.local_nx * state.local_ny * sizeof(double));
 
+    roctxRangePush("grid init");
     hipMalloc(&state.d_rhs, local_size * sizeof(double));
     hipMalloc(&state.d_u, local_size * sizeof(double));
     hipMalloc(&state.d_north_data, state.local_nx * state.local_nz * sizeof(double));
@@ -298,6 +389,7 @@ void initialize_grid(SolverState &state) {
 
     hipMemcpy(state.d_rhs, state.h_rhs, local_size * sizeof(double), hipMemcpyHostToDevice);
     hipMemcpy(state.d_u, state.h_u, local_size * sizeof(double), hipMemcpyHostToDevice);
+    roctxRangePop();
 }
 
 void initialize_boundaries(SolverState &state) {
@@ -358,17 +450,20 @@ void initialize_boundaries(SolverState &state) {
         }
     }
 
+    roctxRangePush("boundary init");
     hipMemcpy(state.d_north_data, state.h_north_data, state.local_nx * state.local_nz * sizeof(double), hipMemcpyHostToDevice);
     hipMemcpy(state.d_south_data, state.h_south_data, state.local_nx * state.local_nz * sizeof(double), hipMemcpyHostToDevice);
     hipMemcpy(state.d_east_data, state.h_east_data, state.local_ny * state.local_nz * sizeof(double), hipMemcpyHostToDevice);
     hipMemcpy(state.d_west_data, state.h_west_data, state.local_ny * state.local_nz * sizeof(double), hipMemcpyHostToDevice);
     hipMemcpy(state.d_top_data, state.h_top_data, state.local_nx * state.local_ny * sizeof(double), hipMemcpyHostToDevice);
     hipMemcpy(state.d_bottom_data, state.h_bottom_data, state.local_nx * state.local_ny * sizeof(double), hipMemcpyHostToDevice);
+    roctxRangePop();
 }
 
 void red_black_update(SolverState &state) {
     // Red pass
-    red_black_kernel<<<state.gridDim, state.blockDim>>>(
+    roctxRangePush("red");
+    red_black_kernel_blocked<<<state.gridDim, state.blockDim>>>(
         state.d_u, state.d_rhs, 
         state.d_north_data, state.d_south_data,
         state.d_east_data, state.d_west_data, 
@@ -376,9 +471,11 @@ void red_black_update(SolverState &state) {
         state.local_nx, state.local_ny, state.local_nz, 
         state.a_x, state.a_y, state.a_z, state.a_f, 0);
     hipDeviceSynchronize();
+    roctxRangePop();
     
     // Black pass
-    red_black_kernel<<<state.gridDim, state.blockDim>>>(
+    roctxRangePush("black");
+    red_black_kernel_blocked<<<state.gridDim, state.blockDim>>>(
         state.d_u, state.d_rhs, 
         state.d_north_data, state.d_south_data,
         state.d_east_data, state.d_west_data, 
@@ -386,9 +483,11 @@ void red_black_update(SolverState &state) {
         state.local_nx, state.local_ny, state.local_nz, 
         state.a_x, state.a_y, state.a_z, state.a_f, 1);
     hipDeviceSynchronize();
+    roctxRangePop();
 }
 
 void halo_exchange(SolverState &state) {
+    roctxRangePush("halo");
     extract_boundaries<<<state.extractGridDim, state.extractBlockDim>>>(
         state.d_u, state.d_out_east, state.d_out_west,
         state.d_out_north, state.d_out_south,
@@ -427,6 +526,7 @@ void halo_exchange(SolverState &state) {
     hipMemcpy(state.d_west_data, state.h_west_data, state.local_ny * state.local_nz * sizeof(double), hipMemcpyHostToDevice);
     hipMemcpy(state.d_top_data, state.h_top_data, state.local_nx * state.local_ny * sizeof(double), hipMemcpyHostToDevice);
     hipMemcpy(state.d_bottom_data, state.h_bottom_data, state.local_nx * state.local_ny * sizeof(double), hipMemcpyHostToDevice);
+    roctxRangePop();
 }
 
 bool check_convergence(SolverState &state, int iter) {
@@ -435,6 +535,7 @@ bool check_convergence(SolverState &state, int iter) {
     if(state.rank == 0) clock_gettime(CLOCK_MONOTONIC, &start);
     
     // Compute local residual
+    roctxRangePush("residual")
     double zero = 0.0;
     hipMemcpy(state.d_residual_sum, &zero, sizeof(double), hipMemcpyHostToDevice);
     
@@ -449,6 +550,7 @@ bool check_convergence(SolverState &state, int iter) {
     
     double local_residual;
     hipMemcpy(&local_residual, state.d_residual_sum, sizeof(double), hipMemcpyDeviceToHost);
+    roctxRangePop();
 
     // Global reduction
     double global_residual = 0.0;
@@ -462,7 +564,7 @@ bool check_convergence(SolverState &state, int iter) {
         double residual_norm = sqrt(global_residual / (state.nx * state.ny * state.nz));
         should_stop = residual_norm < state.convergence_bound;
         
-        if(iter % (state.check_convergence_every_n * 10) == 0 || should_stop) {
+        if(iter % (state.check_convergence_every_n) == 0 || should_stop) {
             printf("Iteration %d: Residual norm = %.10e\n", iter, residual_norm);
         }
     }
@@ -473,6 +575,7 @@ bool check_convergence(SolverState &state, int iter) {
 }
 
 void compare_solution(SolverState &state) {
+    roctxRangePush("MSE");
     double zero = 0.0;
     hipMemcpy(state.d_mse_total, &zero, sizeof(double), hipMemcpyHostToDevice);
     
@@ -487,6 +590,7 @@ void compare_solution(SolverState &state) {
     
     double local_sq_error;
     hipMemcpy(&local_sq_error, state.d_mse_total, sizeof(double), hipMemcpyDeviceToHost);
+    roctxRangePop();
 
     double global_mse = 0.0;
     MPI_Reduce(&local_sq_error, &global_mse, 1, MPI_DOUBLE, MPI_SUM, 0, state.cart_comm);
@@ -501,12 +605,13 @@ void compare_solution(SolverState &state) {
     }
 }
 
-void write_halo_to_file(SolverState &state, const char* filename) {
+void write_local_to_file(SolverState &state, double *data, const char* filename) {
+    int local_size = state.local_nx * state.local_ny * state.local_nz;
     MPI_File fh;
     MPI_File_open(state.cart_comm, filename, 
                   MPI_MODE_CREATE | MPI_MODE_WRONLY, 
                   MPI_INFO_NULL, &fh);
-    
+
     if(state.rank == 0) {
         int header[3] = {state.nx, state.ny, state.nz};
         MPI_File_write(fh, header, 3, MPI_INT, MPI_STATUS_IGNORE);
@@ -515,138 +620,102 @@ void write_halo_to_file(SolverState &state, const char* filename) {
                            state.boundary_end_x, state.boundary_end_y, state.boundary_end_z};
         MPI_File_write(fh, bounds, 6, MPI_DOUBLE, MPI_STATUS_IGNORE);
     }
-    
+
     MPI_Offset header_size = 3 * sizeof(int) + 6 * sizeof(double);
 
-    double *arr = (double*) malloc(state.local_nx * sizeof(double));
-    
-    for(int z = 0; z < state.local_nz; z++) {
-      for(int y = 0; y < state.local_ny; y++) {
-        int global_z = z + state.global_z_start;
-        int global_y = y + state.global_y_start;
+    int gsizes[3] = {state.nz, state.ny, state.nx};
 
-        long long global_offset = global_z * state.nx * state.ny + global_y * state.nx + state.global_x_start;
-        long long local_offset = z * state.local_nx * state.local_ny + y * state.local_nx;
+    int lsizes[3] = {state.local_nz, state.local_ny, state.local_nx};
 
-        for(int i = 0; i < state.local_nx; i++) {
-          if (z == 0 && state.coords[2] > 0) {
-            arr[i] = 1.0;
-            continue;
-          }
-          if (z == state.local_nz-1 && state.coords[2] < state.dims[2]-1) {
-            arr[i] = 1.0;
-            continue;
-          }
-          if (y == 0 && state.coords[1] > 0) {
-            arr[i] = 1.0;
-            continue;
-          }
-          if (y == state.local_ny-1 && state.coords[1] < state.dims[1]-1) {
-            arr[i] = 1.0;
-            continue;
-          }
-          if (i == 0 && state.coords[0] > 0) {
-            arr[i] = 1.0;
-            continue;
-          }
-          if (i == state.local_nx-1 && state.coords[0] < state.dims[0]-1) {
-            arr[i] = 1.0;
-            continue;
-          }
-          arr[i] = 0.0;
-        }
+    int starts[3] = {state.global_z_start, state.global_y_start, state.global_x_start};
 
-        MPI_Offset file_offset = header_size + global_offset * sizeof(double);
-        
-        MPI_File_write_at(fh, file_offset, arr, state.local_nx, 
-                          MPI_DOUBLE, MPI_STATUS_IGNORE);
-      }
-    }
-    
+    MPI_Datatype filetype;
+    MPI_Type_create_subarray(3, gsizes, lsizes, starts, MPI_ORDER_C, MPI_DOUBLE, &filetype);
+    MPI_Type_commit(&filetype);
+
+    MPI_File_set_view(fh, header_size, MPI_DOUBLE, filetype, "native", MPI_INFO_NULL);
+    MPI_File_write(fh, data, local_size, MPI_DOUBLE, MPI_STATUS_IGNORE);
+
     MPI_File_close(&fh);
 }
 
-void write_rank_to_file(SolverState &state, const char* filename) {
-    MPI_File fh;
-    MPI_File_open(state.cart_comm, filename, 
-                  MPI_MODE_CREATE | MPI_MODE_WRONLY, 
-                  MPI_INFO_NULL, &fh);
-    
-    if(state.rank == 0) {
-        int header[3] = {state.nx, state.ny, state.nz};
-        MPI_File_write(fh, header, 3, MPI_INT, MPI_STATUS_IGNORE);
-        
-        double bounds[6] = {state.boundary_start_x, state.boundary_start_y, state.boundary_start_z,
-                           state.boundary_end_x, state.boundary_end_y, state.boundary_end_z};
-        MPI_File_write(fh, bounds, 6, MPI_DOUBLE, MPI_STATUS_IGNORE);
-    }
-    
-    MPI_Offset header_size = 3 * sizeof(int) + 6 * sizeof(double);
-
-    double *arr = (double*) malloc(state.local_nx * sizeof(double));
-    for(int i = 0; i < state.local_nx; i++) arr[i] = (double) state.rank;
+void write_halo_to_file(SolverState &state, const char* filename) {
+    double *arr = (double*) malloc(state.local_nx * state.local_ny * state.local_nz * sizeof(double));
     
     for(int z = 0; z < state.local_nz; z++) {
       for(int y = 0; y < state.local_ny; y++) {
-        int global_z = z + state.global_z_start;
-        int global_y = y + state.global_y_start;
-
-        long long global_offset = global_z * state.nx * state.ny + global_y * state.nx + state.global_x_start;
-        long long local_offset = z * state.local_nx * state.local_ny + y * state.local_nx;
-
-        MPI_Offset file_offset = header_size + global_offset * sizeof(double);
-        
-        MPI_File_write_at(fh, file_offset, arr, state.local_nx, 
-                          MPI_DOUBLE, MPI_STATUS_IGNORE);
+        for(int x = 0; x < state.local_nx; x++) {
+          double val = 0.0;
+          if (z == 0 && state.coords[2] > 0) {
+            val = 1.0;
+          }
+          if (z == state.local_nz-1 && state.coords[2] < state.dims[2]-1) {
+            val = 1.0;
+          }
+          if (y == 0 && state.coords[1] > 0) {
+            val = 1.0;
+          }
+          if (y == state.local_ny-1 && state.coords[1] < state.dims[1]-1) {
+            val = 1.0;
+          }
+          if (x == 0 && state.coords[0] > 0) {
+            val = 1.0;
+          }
+          if (x == state.local_nx-1 && state.coords[0] < state.dims[0]-1) {
+            val = 1.0;
+          }
+          arr[z*state.local_ny*state.local_nx + y*state.local_nx + x] = val;
+        }
       }
     }
-    free(arr);
+
+    write_local_to_file(state, arr, filename);
     
-    MPI_File_close(&fh);
+    free(arr);
+}
+
+void write_rank_to_file(SolverState &state, const char* filename) {
+    double *arr = (double*) malloc(state.local_nx * state.local_ny * state.local_nz * sizeof(double));
+    
+    for(int z = 0; z < state.local_nz; z++) {
+      for(int y = 0; y < state.local_ny; y++) {
+        for(int x = 0; x < state.local_nx; x++) {
+          arr[z*state.local_ny*state.local_nx + y*state.local_nx + x] = state.rank;
+        }
+      }
+    }
+
+    write_local_to_file(state, arr, filename);
+    
+    free(arr);
+}
+
+void write_red_black_to_file(SolverState &state) {
+    double *red = (double*) malloc(state.local_nx * state.local_ny * state.local_nz * sizeof(double));
+    double *black = (double*) malloc(state.local_nx * state.local_ny * state.local_nz * sizeof(double));
+    
+    for(int z = 0; z < state.local_nz; z++) {
+      for(int y = 0; y < state.local_ny; y++) {
+        for(int x = 0; x < state.local_nx; x++) {
+          int sum = x + y + z;
+          red[z*state.local_ny*state.local_nx + y*state.local_nx + x] = (sum % 2) == 0;
+          black[z*state.local_ny*state.local_nx + y*state.local_nx + x] = (sum % 2) == 1;
+        }
+      }
+    }
+
+    write_local_to_file(state, red, "red.bin");
+    write_local_to_file(state, black, "black.bin");
+    
+    free(red);
+    free(black);
 }
 
 void write_solution_to_file(SolverState &state, const char* filename) {
     int local_size = state.local_nx * state.local_ny * state.local_nz;
-
     hipMemcpy(state.h_u, state.d_u, local_size * sizeof(double), hipMemcpyDeviceToHost);
-
-    
-    MPI_File fh;
-    MPI_File_open(state.cart_comm, filename, 
-                  MPI_MODE_CREATE | MPI_MODE_WRONLY, 
-                  MPI_INFO_NULL, &fh);
-    
-    if(state.rank == 0) {
-        int header[3] = {state.nx, state.ny, state.nz};
-        MPI_File_write(fh, header, 3, MPI_INT, MPI_STATUS_IGNORE);
-        
-        double bounds[6] = {state.boundary_start_x, state.boundary_start_y, state.boundary_start_z,
-                           state.boundary_end_x, state.boundary_end_y, state.boundary_end_z};
-        MPI_File_write(fh, bounds, 6, MPI_DOUBLE, MPI_STATUS_IGNORE);
-    }
-    
-    MPI_Offset header_size = 3 * sizeof(int) + 6 * sizeof(double);
-
-    
-    for(int z = 0; z < state.local_nz; z++) {
-      for(int y = 0; y < state.local_ny; y++) {
-        int global_z = z + state.global_z_start;
-        int global_y = y + state.global_y_start;
-
-        long long global_offset = global_z * state.nx * state.ny + global_y * state.nx + state.global_x_start;
-        long long local_offset = z * state.local_nx * state.local_ny + y * state.local_nx;
-
-        MPI_Offset file_offset = header_size + global_offset * sizeof(double);
-        
-        MPI_File_write_at(fh, file_offset, state.h_u + local_offset, state.local_nx, 
-                          MPI_DOUBLE, MPI_STATUS_IGNORE);
-
-      }
-    }
-    
-    MPI_File_close(&fh);
+    write_local_to_file(state, state.h_u, filename);
 }
-
 
 std::string make_filename(const std::string& folder,
                           const std::string& basename,
@@ -685,6 +754,8 @@ void solver(SolverState &state) {
       std::cout << "MPI processes: " << state.size << " (" << state.dims[0] << "x" 
                 << state.dims[1] << "x" << state.dims[2] << ")" << std::endl;
     }
+
+    //write_red_black_to_file(state);
     
     clock_gettime(CLOCK_MONOTONIC, &total_start);
     
@@ -727,7 +798,6 @@ void setup_mpi(SolverState &state) {
     MPI_Comm_size(MPI_COMM_WORLD, &state.size);
     MPI_Comm_rank(MPI_COMM_WORLD, &state.rank);
 
-    state.dims[0] = 0; state.dims[1] = 0; state.dims[2] = 0;
     MPI_Dims_create(state.size, 3, state.dims);
 
     int periods[3] = {0, 0, 0};
@@ -806,6 +876,7 @@ void cleanup(SolverState &state) {
     free(state.h_out_top);
     free(state.h_out_bottom);
 
+    roctxRangePush("cleanup");
     hipFree(state.d_rhs);
     hipFree(state.d_u);
     hipFree(state.d_north_data);
@@ -822,6 +893,7 @@ void cleanup(SolverState &state) {
     hipFree(state.d_out_bottom);
     hipFree(state.d_residual_sum);
     hipFree(state.d_mse_total);
+    roctxRangePop();
 }
 
 int main(int argc, char **argv) {
@@ -829,34 +901,36 @@ int main(int argc, char **argv) {
 
     SolverState state;
     
-    state.nx = 64;
-    state.nz = 64;
-    state.ny = 64;
+    state.nx = 1024;
+    state.nz = 768;
+    state.ny = 512;
 
-    state.blockDim = dim3(32, 8, 4);
+    state.dims[0] = 4; state.dims[1] = 8; state.dims[2] = 0;
+    state.blockDim = dim3(BLOCK_X, BLOCK_Y, BLOCK_Z);
     state.extractBlockDim = dim3(256);
     
-    state.boundary_start_x = -1.0;
-    state.boundary_start_y = -1.0;
-    state.boundary_start_z = -2.0;
-    state.boundary_end_x = 1;
-    state.boundary_end_y = 1;
-    state.boundary_end_z = 2;
+    state.boundary_start_x = -7.0;
+    state.boundary_start_y = -10.0;
+    state.boundary_start_z = -5.0;
+    state.boundary_end_x = 10.0;
+    state.boundary_end_y = 3.0;
+    state.boundary_end_z = 5.0;
     
-    state.max_iter = 500000;
-    state.check_convergence_every_n = 100;
+    state.max_iter = 2000000;
+    state.check_convergence_every_n = 1000;
     state.convergence_bound = 1e-6;
     
+    state.write_solution = false;
+    state.write_solution_every_n = 10;
+    state.last_write = 200;
+    state.output_dir = "output";
+
     state.avg_update_time = 0;
     state.avg_reduction_time = 0;
     state.n_iters = 0;
     state.n_reductions = 0;
 
-    state.write_solution = true;
-    state.write_solution_every_n = 100;
-    state.last_write = 0;
-    state.output_dir = "output_helix";
-
+    roctxRangePush("focus area");
     setup_mpi(state);
     setup_hip(state);
     
@@ -864,6 +938,7 @@ int main(int argc, char **argv) {
     
     cleanup(state);
     MPI_Finalize();
+    roctxRangePop();
 
     return 0;
 }
