@@ -100,11 +100,14 @@ struct SolverState {
     dim3 extractBlockDim, extractGridDim;
     
     // Statistics and logging
-    double avg_update_time, avg_reduction_time;
-    int n_iters, n_reductions;
+    double avg_update_time, avg_reduction_time, avg_mse_time;
+    int n_iters, n_reductions, n_mse_calculations;
     bool write_solution;
     int write_solution_every_n, last_write;
     std::string output_dir;
+
+    // Solver Config
+    bool use_red_black, use_blocking, use_gpu_aware_mpi;
 };
 
 // Red-Black Gauss-Seidel kernel with blocking
@@ -463,25 +466,45 @@ void initialize_boundaries(SolverState &state) {
 void red_black_update(SolverState &state) {
     // Red pass
     roctxRangePush("red");
-    red_black_kernel_blocked<<<state.gridDim, state.blockDim>>>(
-        state.d_u, state.d_rhs, 
-        state.d_north_data, state.d_south_data,
-        state.d_east_data, state.d_west_data, 
-        state.d_top_data, state.d_bottom_data,
-        state.local_nx, state.local_ny, state.local_nz, 
-        state.a_x, state.a_y, state.a_z, state.a_f, 0);
+    if (state.use_blocking) {
+      red_black_kernel_blocked<<<state.gridDim, state.blockDim>>>(
+          state.d_u, state.d_rhs, 
+          state.d_north_data, state.d_south_data,
+          state.d_east_data, state.d_west_data, 
+          state.d_top_data, state.d_bottom_data,
+          state.local_nx, state.local_ny, state.local_nz, 
+          state.a_x, state.a_y, state.a_z, state.a_f, 0);
+    } else {
+      red_black_kernel<<<state.gridDim, state.blockDim>>>(
+          state.d_u, state.d_rhs, 
+          state.d_north_data, state.d_south_data,
+          state.d_east_data, state.d_west_data, 
+          state.d_top_data, state.d_bottom_data,
+          state.local_nx, state.local_ny, state.local_nz, 
+          state.a_x, state.a_y, state.a_z, state.a_f, 0);
+    }
     hipDeviceSynchronize();
     roctxRangePop();
     
     // Black pass
     roctxRangePush("black");
-    red_black_kernel_blocked<<<state.gridDim, state.blockDim>>>(
-        state.d_u, state.d_rhs, 
-        state.d_north_data, state.d_south_data,
-        state.d_east_data, state.d_west_data, 
-        state.d_top_data, state.d_bottom_data,
-        state.local_nx, state.local_ny, state.local_nz, 
-        state.a_x, state.a_y, state.a_z, state.a_f, 1);
+    if (state.use_blocking) {
+      red_black_kernel_blocked<<<state.gridDim, state.blockDim>>>(
+          state.d_u, state.d_rhs, 
+          state.d_north_data, state.d_south_data,
+          state.d_east_data, state.d_west_data, 
+          state.d_top_data, state.d_bottom_data,
+          state.local_nx, state.local_ny, state.local_nz, 
+          state.a_x, state.a_y, state.a_z, state.a_f, 1);
+    } else {
+      red_black_kernel<<<state.gridDim, state.blockDim>>>(
+          state.d_u, state.d_rhs, 
+          state.d_north_data, state.d_south_data,
+          state.d_east_data, state.d_west_data, 
+          state.d_top_data, state.d_bottom_data,
+          state.local_nx, state.local_ny, state.local_nz, 
+          state.a_x, state.a_y, state.a_z, state.a_f, 1);
+    }
     hipDeviceSynchronize();
     roctxRangePop();
 }
@@ -493,13 +516,37 @@ void halo_exchange(SolverState &state) {
         state.d_out_north, state.d_out_south,
         state.d_out_top, state.d_out_bottom,
         state.local_nx, state.local_ny, state.local_nz);
+
+    if (state.use_gpu_aware_mpi) {
+      MPI_Request reqs[12];
+      int count = 0;
+
+      if(state.coords[0] < state.dims[0]-1) MPI_Irecv(state.d_east_data, state.local_ny*state.local_nz, MPI_DOUBLE, state.east, 1, state.cart_comm, &reqs[count++]);
+      if(state.coords[0] > 0) MPI_Irecv(state.d_west_data, state.local_ny*state.local_nz, MPI_DOUBLE, state.west, 2, state.cart_comm, &reqs[count++]);
+      if(state.coords[1] < state.dims[1]-1) MPI_Irecv(state.d_north_data, state.local_nx*state.local_nz, MPI_DOUBLE, state.north, 3, state.cart_comm, &reqs[count++]);
+      if(state.coords[1] > 0) MPI_Irecv(state.d_south_data, state.local_nx*state.local_nz, MPI_DOUBLE, state.south, 4, state.cart_comm, &reqs[count++]);
+      if(state.coords[2] < state.dims[2]-1) MPI_Irecv(state.d_top_data, state.local_nx*state.local_ny, MPI_DOUBLE, state.top, 5, state.cart_comm, &reqs[count++]);
+      if(state.coords[2] > 0) MPI_Irecv(state.d_bottom_data, state.local_nx*state.local_ny, MPI_DOUBLE, state.bottom, 6, state.cart_comm, &reqs[count++]);
+
+      if(state.coords[0] > 0) MPI_Isend(state.d_out_west, state.local_ny*state.local_nz, MPI_DOUBLE, state.west, 1, state.cart_comm, &reqs[count++]);
+      if(state.coords[0] < state.dims[0]-1) MPI_Isend(state.d_out_east, state.local_ny*state.local_nz, MPI_DOUBLE, state.east, 2, state.cart_comm, &reqs[count++]);
+      if(state.coords[1] > 0) MPI_Isend(state.d_out_south, state.local_nx*state.local_nz, MPI_DOUBLE, state.south, 3, state.cart_comm, &reqs[count++]);
+      if(state.coords[1] < state.dims[1]-1) MPI_Isend(state.d_out_north, state.local_nx*state.local_nz, MPI_DOUBLE, state.north, 4, state.cart_comm, &reqs[count++]);
+      if(state.coords[2] > 0) MPI_Isend(state.d_out_bottom, state.local_nx*state.local_ny, MPI_DOUBLE, state.bottom, 5, state.cart_comm, &reqs[count++]);
+      if(state.coords[2] < state.dims[2]-1) MPI_Isend(state.d_out_top, state.local_nx*state.local_ny, MPI_DOUBLE, state.top, 6, state.cart_comm, &reqs[count++]);
+
+      MPI_Waitall(count, reqs, MPI_STATUSES_IGNORE);
+      
+      roctxRangePop();
+      return;
+    }
     
-    hipMemcpy(state.h_out_east, state.d_out_east, state.local_ny * state.local_nz * sizeof(double), hipMemcpyDeviceToHost);
-    hipMemcpy(state.h_out_west, state.d_out_west, state.local_ny * state.local_nz * sizeof(double), hipMemcpyDeviceToHost);
-    hipMemcpy(state.h_out_north, state.d_out_north, state.local_nx * state.local_nz * sizeof(double), hipMemcpyDeviceToHost);
-    hipMemcpy(state.h_out_south, state.d_out_south, state.local_nx * state.local_nz * sizeof(double), hipMemcpyDeviceToHost);
-    hipMemcpy(state.h_out_top, state.d_out_top, state.local_nx * state.local_ny * sizeof(double), hipMemcpyDeviceToHost);
-    hipMemcpy(state.h_out_bottom, state.d_out_bottom, state.local_nx * state.local_ny * sizeof(double), hipMemcpyDeviceToHost);
+    if(state.coords[0] < state.dims[0]-1) hipMemcpy(state.h_out_east, state.d_out_east, state.local_ny * state.local_nz * sizeof(double), hipMemcpyDeviceToHost);
+    if(state.coords[0] > 0) hipMemcpy(state.h_out_west, state.d_out_west, state.local_ny * state.local_nz * sizeof(double), hipMemcpyDeviceToHost);
+    if(state.coords[1] < state.dims[1]-1) hipMemcpy(state.h_out_north, state.d_out_north, state.local_nx * state.local_nz * sizeof(double), hipMemcpyDeviceToHost);
+    if(state.coords[1] > 0) hipMemcpy(state.h_out_south, state.d_out_south, state.local_nx * state.local_nz * sizeof(double), hipMemcpyDeviceToHost);
+    if(state.coords[2] < state.dims[2]-1) hipMemcpy(state.h_out_top, state.d_out_top, state.local_nx * state.local_ny * sizeof(double), hipMemcpyDeviceToHost);
+    if(state.coords[2] > 0) hipMemcpy(state.h_out_bottom, state.d_out_bottom, state.local_nx * state.local_ny * sizeof(double), hipMemcpyDeviceToHost);
     
     MPI_Request reqs[12];
     int count = 0;
@@ -520,12 +567,12 @@ void halo_exchange(SolverState &state) {
 
     MPI_Waitall(count, reqs, MPI_STATUSES_IGNORE);
     
-    hipMemcpy(state.d_north_data, state.h_north_data, state.local_nx * state.local_nz * sizeof(double), hipMemcpyHostToDevice);
-    hipMemcpy(state.d_south_data, state.h_south_data, state.local_nx * state.local_nz * sizeof(double), hipMemcpyHostToDevice);
-    hipMemcpy(state.d_east_data, state.h_east_data, state.local_ny * state.local_nz * sizeof(double), hipMemcpyHostToDevice);
-    hipMemcpy(state.d_west_data, state.h_west_data, state.local_ny * state.local_nz * sizeof(double), hipMemcpyHostToDevice);
-    hipMemcpy(state.d_top_data, state.h_top_data, state.local_nx * state.local_ny * sizeof(double), hipMemcpyHostToDevice);
-    hipMemcpy(state.d_bottom_data, state.h_bottom_data, state.local_nx * state.local_ny * sizeof(double), hipMemcpyHostToDevice);
+    if(state.coords[1] < state.dims[1]-1) hipMemcpy(state.d_north_data, state.h_north_data, state.local_nx * state.local_nz * sizeof(double), hipMemcpyHostToDevice);
+    if(state.coords[1] > 0) hipMemcpy(state.d_south_data, state.h_south_data, state.local_nx * state.local_nz * sizeof(double), hipMemcpyHostToDevice);
+    if(state.coords[0] < state.dims[0]-1) hipMemcpy(state.d_east_data, state.h_east_data, state.local_ny * state.local_nz * sizeof(double), hipMemcpyHostToDevice);
+    if(state.coords[0] > 0) hipMemcpy(state.d_west_data, state.h_west_data, state.local_ny * state.local_nz * sizeof(double), hipMemcpyHostToDevice);
+    if(state.coords[2] < state.dims[2]-1) hipMemcpy(state.d_top_data, state.h_top_data, state.local_nx * state.local_ny * sizeof(double), hipMemcpyHostToDevice);
+    if(state.coords[2] > 0) hipMemcpy(state.d_bottom_data, state.h_bottom_data, state.local_nx * state.local_ny * sizeof(double), hipMemcpyHostToDevice);
     roctxRangePop();
 }
 
@@ -535,7 +582,7 @@ bool check_convergence(SolverState &state, int iter) {
     if(state.rank == 0) clock_gettime(CLOCK_MONOTONIC, &start);
     
     // Compute local residual
-    roctxRangePush("residual")
+    roctxRangePush("residual");
     double zero = 0.0;
     hipMemcpy(state.d_residual_sum, &zero, sizeof(double), hipMemcpyHostToDevice);
     
@@ -561,7 +608,7 @@ bool check_convergence(SolverState &state, int iter) {
         clock_gettime(CLOCK_MONOTONIC, &end);
         state.avg_reduction_time += elapsed_time(start, end);
         
-        double residual_norm = sqrt(global_residual / (state.nx * state.ny * state.nz));
+        double residual_norm = sqrt(global_residual / ((uint64_t)state.nx * (uint64_t)state.ny * (uint64_t)state.nz));
         should_stop = residual_norm < state.convergence_bound;
         
         if(iter % (state.check_convergence_every_n) == 0 || should_stop) {
@@ -575,7 +622,9 @@ bool check_convergence(SolverState &state, int iter) {
 }
 
 void compare_solution(SolverState &state) {
+    state.n_mse_calculations++;
     roctxRangePush("MSE");
+    if(state.rank == 0) clock_gettime(CLOCK_MONOTONIC, &start);
     double zero = 0.0;
     hipMemcpy(state.d_mse_total, &zero, sizeof(double), hipMemcpyHostToDevice);
     
@@ -595,13 +644,9 @@ void compare_solution(SolverState &state) {
     double global_mse = 0.0;
     MPI_Reduce(&local_sq_error, &global_mse, 1, MPI_DOUBLE, MPI_SUM, 0, state.cart_comm);
 
-    if (state.rank == 0) {
-        std::cout << "\n=== Final Results ===" << std::endl;
-        std::cout << "Avg time per update: " << state.avg_update_time / state.n_iters << " s" << std::endl; 
-        std::cout << "Avg time per reduction: " << state.avg_reduction_time / state.n_reductions << " s" << std::endl; 
-        std::cout << "Total time to converge: " << elapsed_time(total_start, total_end) << " s" << std::endl; 
-        std::cout << "Final MSE: " << global_mse/(state.nx * state.ny * state.nz) << std::endl;
-        std::cout << "Iterations to converge: " << state.n_iters << std::endl;
+    if(state.rank == 0) {
+      clock_gettime(CLOCK_MONOTONIC, &end);
+      state.avg_mse_time += elapsed_time(start, end);
     }
 }
 
@@ -773,8 +818,9 @@ void solver(SolverState &state) {
             state.avg_update_time += elapsed_time(start, end);
         }
         
-        if(iter % state.check_convergence_every_n == 0 && iter != 0) {
+        if(iter % state.check_convergence_every_n == 0) {
             bool converged = check_convergence(state, iter);
+	    compare_solution(state);
             if(converged) {
                 break;
             }
@@ -792,6 +838,15 @@ void solver(SolverState &state) {
     if(state.write_solution && (state.last_write == 0 || iter <= state.last_write)) write_solution_to_file(state, make_filename(state.output_dir, "solution", iter, state.max_iter).c_str());
     //write_rank_to_file(state, "ranks.bin");
     //write_halo_to_file(state, "halo.bin");
+
+    if (state.rank == 0) {
+        std::cout << "\n=== Final Results ===" << std::endl;
+        std::cout << "Avg time per update: " << state.avg_update_time / state.n_iters << " s" << std::endl; 
+        std::cout << "Avg time per residual calculation: " << state.avg_reduction_time / state.n_reductions << " s" << std::endl; 
+        std::cout << "Avg time per MSE calculation: " << state.avg_mse_time / state.n_mse_calculations << " s" << std::endl; 
+        std::cout << "Total time: " << elapsed_time(total_start, total_end) << " s" << std::endl; 
+        std::cout << "Iterations: " << state.n_iters << std::endl;
+    }
 }
 
 void setup_mpi(SolverState &state) {
@@ -901,23 +956,23 @@ int main(int argc, char **argv) {
 
     SolverState state;
     
-    state.nx = 1024;
-    state.nz = 768;
-    state.ny = 512;
+    state.nx = 2048;
+    state.nz = 2048;
+    state.ny = 2048;
 
-    state.dims[0] = 4; state.dims[1] = 8; state.dims[2] = 0;
+    state.dims[0] = 0; state.dims[1] = 0; state.dims[2] = 0;
     state.blockDim = dim3(BLOCK_X, BLOCK_Y, BLOCK_Z);
     state.extractBlockDim = dim3(256);
     
-    state.boundary_start_x = -7.0;
-    state.boundary_start_y = -10.0;
-    state.boundary_start_z = -5.0;
-    state.boundary_end_x = 10.0;
-    state.boundary_end_y = 3.0;
-    state.boundary_end_z = 5.0;
+    state.boundary_start_x = 0.0;
+    state.boundary_start_y = 0.0;
+    state.boundary_start_z = 0.0;
+    state.boundary_end_x = 1.0;
+    state.boundary_end_y = 1.0;
+    state.boundary_end_z = 1.0;
     
-    state.max_iter = 2000000;
-    state.check_convergence_every_n = 1000;
+    state.max_iter = 100;
+    state.check_convergence_every_n = 10;
     state.convergence_bound = 1e-6;
     
     state.write_solution = false;
@@ -927,8 +982,13 @@ int main(int argc, char **argv) {
 
     state.avg_update_time = 0;
     state.avg_reduction_time = 0;
+    state.avg_mse_time = 0;
     state.n_iters = 0;
     state.n_reductions = 0;
+    state.n_mse_calculations = 0;
+
+    state.use_gpu_aware_mpi = true;
+    state.use_blocking = false;
 
     roctxRangePush("focus area");
     setup_mpi(state);
